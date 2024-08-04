@@ -17,6 +17,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 // ErrBadHandshake is returned when the server response to opening handshake is
@@ -244,18 +246,39 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 		defer cancel()
 	}
 
-	var netDial netDialerFunc
-	switch {
-	case u.Scheme == "https" && d.NetDialTLSContext != nil:
-		netDial = d.NetDialTLSContext
-	case d.NetDialContext != nil:
-		netDial = d.NetDialContext
-	case d.NetDial != nil:
-		netDial = func(ctx context.Context, net, addr string) (net.Conn, error) {
-			return d.NetDial(net, addr)
+	netDial := newNetDialerFunc(u.Scheme, d.NetDial, d.NetDialContext, d.NetDialTLSContext)
+
+	// If needed, wrap the dial function to connect through a proxy.
+	if d.Proxy != nil {
+		proxyURL, err := d.Proxy(req)
+		if err != nil {
+			return nil, nil, err
 		}
-	default:
-		netDial = (&net.Dialer{}).DialContext
+		if proxyURL != nil {
+			forwardDial := newNetDialerFunc(proxyURL.Scheme, d.NetDial, d.NetDialContext, d.NetDialTLSContext)
+			if proxyURL.Scheme == "https" && d.NetDialTLSContext == nil {
+				tlsClientConfig := cloneTLSConfig(d.TLSClientConfig)
+				if tlsClientConfig.ServerName == "" {
+					_, hostNoPort := hostPortNoPort(proxyURL)
+					tlsClientConfig.ServerName = hostNoPort
+				}
+				netDial = newHTTPProxyDialerFunc(proxyURL, forwardDial, tlsClientConfig)
+			} else if proxyURL.Scheme == "http" || proxyURL.Scheme == "https" {
+				netDial = newHTTPProxyDialerFunc(proxyURL, forwardDial, nil)
+			} else {
+				dialer, err := proxy.FromURL(proxyURL, forwardDial)
+				if err != nil {
+					return nil, nil, err
+				}
+				if d, ok := dialer.(proxy.ContextDialer); ok {
+					netDial = d.DialContext
+				} else {
+					netDial = func(ctx context.Context, net, addr string) (net.Conn, error) {
+						return dialer.Dial(net, addr)
+					}
+				}
+			}
+		}
 	}
 
 	// If needed, wrap the dial function to set the connection deadline.
@@ -272,20 +295,6 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 				return nil, err
 			}
 			return c, nil
-		}
-	}
-
-	// If needed, wrap the dial function to connect through a proxy.
-	if d.Proxy != nil {
-		proxyURL, err := d.Proxy(req)
-		if err != nil {
-			return nil, nil, err
-		}
-		if proxyURL != nil {
-			netDial, err = proxyFromURL(proxyURL, netDial)
-			if err != nil {
-				return nil, nil, err
-			}
 		}
 	}
 
